@@ -823,7 +823,10 @@ bool HTLayoutGrid::render_tile_cache(
         *workspace->m_renderOffset = Vector2D {};
     }
 
-    CBox render_box = {Vector2D {}, box.size()};
+    // renderWorkspace scales by geometry.width / m_pixelSize.x, so the
+    // geometry must be the framebuffer's pixel size, not the logical tile box.
+    // At scale 1.25 a logical box would fill only 80% of the tile.
+    CBox render_box = {Vector2D {}, size};
     if (monitor->m_transform % 2 == 1)
         std::swap(render_box.w, render_box.h);
 
