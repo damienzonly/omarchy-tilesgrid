@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -u
+
+plugin_dir="$HOME/.config/omarchy/plugins/tilesgrid"
+log_file="$HOME/.local/state/tilesgrid/update-hook.log"
+
+[[ -x "$plugin_dir/install.sh" ]] || exit 0
+
+mkdir -p "$(dirname "$log_file")"
+{
+  echo "=== $(date '+%Y-%m-%d %H:%M:%S') tilesgrid rebuild after Omarchy update ==="
+} >>"$log_file"
+
+if "$plugin_dir/install.sh" --rebuild-only >>"$log_file" 2>&1; then
+  omarchy-notification-send -u low -g "󰐃" \
+    "tilesgrid rebuilt" \
+    "Restart Hyprland to load the new plugin" 2>/dev/null || true
+  echo "rebuild ok" >>"$log_file"
+else
+  omarchy-notification-send -u critical -g "󰐃" \
+    "tilesgrid rebuild failed" \
+    "The old plugin was left in place. See $log_file" 2>/dev/null || true
+  echo "rebuild FAILED" >>"$log_file"
+fi

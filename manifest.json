@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "tilesgrid",
+  "name": "tilesgrid",
+  "version": "0.1.0",
+  "author": "damienzonly",
+  "description": "Workspace and page indicator for the tilesgrid Hyprland plugin",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "tilesgrid",
+    "description": "Workspace/page indicator owned by the tilesgrid plugin",
+    "category": "Compositor",
+    "allowMultiple": false,
+    "defaultSection": "left"
+  }
+}
