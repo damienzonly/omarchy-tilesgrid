@@ -346,6 +346,11 @@ if hl.plugin.tilesgrid then
         layout = "grid",
         drag_button = 0x111,   -- right mouse button
         select_button = 0x110, -- left mouse button
+        -- Full-resolution live previews by default. Set mode = "cached" to
+        -- trade sharpness for speed on slower GPUs (tune preview:scale then).
+        preview = {
+          mode = "live",
+        },
       },
     },
   })

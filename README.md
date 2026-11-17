@@ -157,9 +157,9 @@ Plugin options live under `plugin:tilesgrid:` and are read from
 | `select_button` | left mouse | Button that selects a tile |
 | `bg_color` | `0xFF1E1E2E` | Overview background |
 | `page_strip` | enabled | Page tab strip at the bottom |
-| `preview:mode` | `"cached"` | `cached` composites tile snapshots; `live` renders all nine workspaces every frame |
+| `preview:mode` | `"live"` | `live` renders all nine workspaces every frame at full resolution; `cached` composites downscaled tile snapshots |
 | `preview:refresh_tiles` | `2` | Tile previews re-rendered per frame in cached mode |
-| `preview:scale` | `0.5` | Offscreen preview resolution, as a fraction of the tile size |
+| `preview:scale` | `0.5` | Cached-mode offscreen resolution, as a fraction of the tile size |
 
 The native plugin exposes `hl.plugin.tilesgrid.focus(n)`,
 `hl.plugin.tilesgrid.move_to_tile(n, follow)`, and
@@ -168,14 +168,14 @@ The native plugin exposes `hl.plugin.tilesgrid.focus(n)`,
 ## GPU rendering
 
 The overview is rendered by Hyprland's OpenGL renderer in the compositor's render
-pass. By default each tile is an offscreen texture refreshed a couple of tiles per
-frame, so the overview stays at display refresh rate instead of re-rendering all nine
-workspaces every frame. Pages, borders, and the strip are drawn on the GPU; nothing is
-screenshotted or composed on the CPU.
+pass. By default it uses live previews: every one of the nine workspaces is rendered
+each frame at full resolution, so text and images stay sharp. Pages, borders, and the
+strip are drawn on the GPU; nothing is screenshotted or composed on the CPU.
 
-If you prefer sharper previews at the cost of frame rate, raise `preview:scale` toward
-`1.0`; for even smoother motion, lower it to `0.4` or set `preview:refresh_tiles` to
-`1`. `preview:mode = "live"` restores the old render-every-tile-per-frame behavior.
+On slower GPUs or very high refresh rates, `preview:mode = "cached"` composites
+downscaled offscreen tile snapshots instead (a couple of tiles refreshed per frame).
+Cached mode is softer by design; raise `preview:scale` toward `1.0` for sharper tiles
+or lower it for smoother motion, and adjust `preview:refresh_tiles`.
 
 ## Security note
 
