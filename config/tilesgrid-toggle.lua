@@ -127,9 +127,10 @@ end
 
 local bases = read_bases()
 
--- Omarchy's stock workspace manager stores each monitor's block (1, 2, ...) in
--- ~/.local/state/omarchy/monitor-workspaces. Seeding from it keeps the page-1
--- workspace IDs a user already has when tilesgrid takes over.
+-- Omarchy's stock workspace manager stores each monitor's block (0, 1, ...) in
+-- ~/.local/state/omarchy/monitor-workspaces; block N owns workspaces N*10+1
+-- through N*10+10. Seeding from it keeps the page-1 workspace IDs a user already
+-- has when tilesgrid takes over.
 local function read_legacy_blocks()
   local result = { by_connector = {}, by_description = {}, by_name = {} }
   local file = io.open(STATE_HOME .. "/omarchy/monitor-workspaces", "r")
@@ -140,7 +141,7 @@ local function read_legacy_blocks()
   for line in file:lines() do
     local block, connector, identity = line:match("^(%d+)\t([^\t]*)\t(.+)$")
     if block ~= nil then
-      local base = (tonumber(block) - 1) * 10
+      local base = tonumber(block) * 10
       if base >= 0 and base < STRIDE then
         if connector ~= "" then
           result.by_connector[connector] = base
@@ -185,26 +186,25 @@ local function base_used_by_other(identity, base)
   return false
 end
 
--- Assign stable bases to connected monitors. Existing tilesgrid bases win; a
--- migrated Omarchy block comes next, then a user's own
--- monitor_workspace_offset(name). Otherwise assign the lowest free 0/10/20...
--- base.
+-- Assign stable bases to connected monitors. Existing tilesgrid bases win,
+-- then a user's own monitor_workspace_offset(name), then a migrated stock
+-- Omarchy block. Otherwise assign the lowest free 0/10/20... base.
 for _, monitor in ipairs(connected_monitors()) do
   local identity = identity_of(monitor)
   local base = bases[identity]
-
-  if base == nil then
-    local legacy = legacy_base_for(monitor)
-    if legacy ~= nil and not base_used_by_other(identity, legacy) then
-      base = legacy
-    end
-  end
 
   if base == nil and _G.monitor_workspace_offset ~= nil then
     local candidate = _G.monitor_workspace_offset(monitor.name)
     if type(candidate) == "number" and candidate >= 0 and candidate < STRIDE
       and not base_used_by_other(identity, candidate) then
       base = candidate
+    end
+  end
+
+  if base == nil then
+    local legacy = legacy_base_for(monitor)
+    if legacy ~= nil and not base_used_by_other(identity, legacy) then
+      base = legacy
     end
   end
 
@@ -293,12 +293,15 @@ end
 
 -- Load the native plugin. Hyprland records config-time loads and reloads the
 -- config once the plugin is in, which is the pass that applies
--- plugin:tilesgrid:* options.
-local plugin_path = HOME .. "/.local/lib/hyprland/libtilesgrid.so"
-local plugin_file = io.open(plugin_path, "r")
-if plugin_file then
-  plugin_file:close()
-  hl.plugin.load(plugin_path)
+-- plugin:tilesgrid:* options. A config that already loaded it (for example a
+-- hand-written hypr/tilesgrid.lua) is left alone.
+if not (hl.plugin and hl.plugin.tilesgrid) then
+  local plugin_path = HOME .. "/.local/lib/hyprland/libtilesgrid.so"
+  local plugin_file = io.open(plugin_path, "r")
+  if plugin_file then
+    plugin_file:close()
+    hl.plugin.load(plugin_path)
+  end
 end
 
 if hl.plugin.tilesgrid then
