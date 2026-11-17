@@ -40,6 +40,10 @@ map; special/scratchpad workspaces are intentionally excluded from it.
 - Hyprland headers matching the running compositor (`hyprland` package).
 - Build tools: `meson`, `ninja`, `g++` (C++23), `pkg-config`, `python3`.
 
+Tested against Omarchy 4.5 and Hyprland 0.56.x. The native plugin uses Hyprland's
+C++ API, so a different Hyprland release series may need source changes as well as a
+rebuild.
+
 The native plugin is compiled against your installed Hyprland headers. A Hyprland
 update changes the plugin ABI, so the plugin must be rebuilt after every Hyprland
 update. The bundled post-update hook does this automatically and asks you to restart
