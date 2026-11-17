@@ -42,6 +42,13 @@ fail() {
   exit 1
 }
 
+# Cheap liveness check for the compositor. A wedged Hyprland still accepts a
+# connection on its socket but never replies, so use a timeout.
+compositor_alive() {
+  command -v timeout >/dev/null 2>&1 || return 0
+  timeout 5 hyprctl monitors >/dev/null 2>&1
+}
+
 # hyprpm keeps the enabled/disabled state (and built plugins) in
 # /var/cache/hyprpm/$USER. It must be writable by the user; a root-owned cache
 # (from running hyprpm via sudo once) makes every disable/enable fail with
@@ -79,6 +86,17 @@ hyprtasking_so() {
     fi
   done
   return 1
+}
+
+# hyprpm can fail to persist its own state ("Failed to write plugin state") even
+# when the cache is user-writable. The recorded flag is plain TOML, so fall
+# back to flipping it directly -- hyprpm reload reads this file.
+disable_hyprtasking_state_fallback() {
+  local state="$HYPRPM_STATE_DIR/hyprtasking/state.toml"
+  [[ -f "$state" && -w "$state" ]] || return 1
+  cp -a "$state" "$state.tilesgrid.bak" 2>/dev/null || true
+  sed -i 's/^enabled[[:space:]]*=[[:space:]]*true[[:space:]]*$/enabled = false/' "$state" || return 1
+  ! hyprtasking_enabled
 }
 
 [[ $EUID -ne 0 ]] || fail "run install.sh as your user, not root"
@@ -196,7 +214,71 @@ backup_if_replaced() {
   if [[ -n "$package" ]] && cmp -s "$source" "$package"; then
     return 0
   fi
+  # An older version of our own file is still our output, not the file the
+  # uninstaller should restore. All three files we replace mention tilesgrid.
+  if grep -qi 'tilesgrid' "$source" 2>/dev/null; then
+    return 0
+  fi
   cp -a "$source" "$target"
+}
+
+# Undo this run's config changes. Used when the post-install reload leaves the
+# compositor unresponsive, so the next login restores a working desktop.
+restore_or_remove() {
+  local backup="$1" target="$2" package="$3"
+  if [[ -f "$backup" ]] && ! cmp -s "$backup" "$package"; then
+    cp -a "$backup" "$target"
+  else
+    rm -f "$target"
+  fi
+}
+
+rollback_config() {
+  restore_or_remove "$BACKUP_DIR/monitor-workspaces.lua" "$SHADOW_FILE" \
+    "$PLUGIN_DIR/config/monitor-workspaces.lua"
+  restore_or_remove "$BACKUP_DIR/toggle.lua" "$TOGGLE_FILE" \
+    "$PLUGIN_DIR/config/tilesgrid-toggle.lua"
+  restore_or_remove "$BACKUP_DIR/tilesgrid-rebuild.hook" "$HOOK_FILE" \
+    "$PLUGIN_DIR/config/tilesgrid-rebuild.hook"
+
+  # Never restore a backup blindly: old installers could capture a shell.json
+  # that already contained the tilesgrid widget. Strip tilesgrid from the live
+  # file and put the stock widget back instead.
+  [[ -f "$SHELL_JSON" ]] || return 0
+  python3 - "$SHELL_JSON" <<'PY' >>"$LOG_FILE" 2>&1 || true
+import json, os, sys, tempfile
+
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        config = json.load(f)
+except Exception:
+    raise SystemExit(0)
+
+layout = config.get("bar", {}).get("layout", {}) or {}
+placed = False
+for section, items in list(layout.items()):
+    if not isinstance(items, list):
+        continue
+    out = []
+    for item in items:
+        if isinstance(item, dict) and str(item.get("id", "")) == "tilesgrid":
+            if not placed:
+                out.append({"id": "omarchy.workspaces"})
+                placed = True
+            continue
+        out.append(item)
+    layout[section] = out
+
+if not placed:
+    layout.setdefault("left", []).insert(0, {"id": "omarchy.workspaces"})
+
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".shell.json.")
+with os.fdopen(fd, "w") as f:
+    json.dump(config, f, indent=2)
+    f.write("\n")
+os.replace(tmp, path)
+PY
 }
 
 backup_if_replaced "$SHADOW_FILE" "$BACKUP_DIR/monitor-workspaces.lua" \
@@ -231,6 +313,30 @@ workspace_like = any(
 if workspace_like or "tilesgrid" not in ids:
     shutil.copy2(source, target)
 PY
+fi
+
+# --- Upstream hyprtasking ---------------------------------------------------
+# Both plugins hook the same render/input functions. Resolve this conflict
+# BEFORE touching any config so a failure leaves the machine exactly as it was.
+# hyprpm only records state here; never unload a hooking plugin from a live
+# compositor (that is what made older installs wedge Hyprland).
+if hyprtasking_enabled; then
+  log "disabling upstream hyprtasking"
+  if ! hyprpm_error="$(hyprpm disable hyprtasking 2>&1)"; then
+    log "hyprpm disable failed: ${hyprpm_error:-unknown error}"
+    if disable_hyprtasking_state_fallback; then
+      log "recorded hyprtasking as disabled in $HYPRPM_STATE_DIR"
+    else
+      notify critical "tilesgrid not installed" \
+        "hyprtasking could not be disabled, so nothing was changed. Run 'hyprpm disable hyprtasking' (or sudo chown -R $USER $HYPRPM_STATE_DIR) and retry."
+      fail "hyprtasking is still enabled; aborting before installing config"
+    fi
+  fi
+  if hyprtasking_enabled; then
+    notify critical "tilesgrid not installed" \
+      "hyprtasking is still enabled, so nothing was changed."
+    fail "hyprtasking is still enabled; aborting before installing config"
+  fi
 fi
 
 install -Dm644 "$PLUGIN_DIR/config/monitor-workspaces.lua" "$SHADOW_FILE"
@@ -289,23 +395,6 @@ os.replace(tmp, path)
 PY
 fi
 
-# Upstream hyprtasking hooks the same render/input functions. Disable it while
-# it is actually enabled (hyprpm list still mentions the repository once it is
-# disabled), and report the real error instead of swallowing it.
-if hyprtasking_enabled; then
-  log "disabling upstream hyprtasking"
-  if ! hyprpm_error="$(hyprpm disable hyprtasking 2>&1)"; then
-    log "hyprpm disable failed: ${hyprpm_error:-unknown error}"
-    if [[ -d "$HYPRPM_STATE_DIR" && ! -w "$HYPRPM_STATE_DIR" ]]; then
-      notify critical "hyprtasking is still enabled" \
-        "hyprpm cannot write $HYPRPM_STATE_DIR (owner: $(stat -c '%U' "$HYPRPM_STATE_DIR" 2>/dev/null || echo unknown)). Run: sudo chown -R $USER $HYPRPM_STATE_DIR, then re-run this installer"
-    else
-      notify critical "hyprtasking is still enabled" \
-        "hyprpm disable failed: ${hyprpm_error:-unknown error}. Run 'hyprpm disable hyprtasking' before restarting Hyprland"
-    fi
-  fi
-fi
-
 if [[ "${TILESGRID_SKIP_RELOAD:-0}" != "1" ]] && command -v hyprctl >/dev/null 2>&1; then
   plugin_loaded=0
   if hyprctl plugin list 2>/dev/null | grep -q 'tilesgrid'; then
@@ -324,6 +413,32 @@ if [[ "${TILESGRID_SKIP_RELOAD:-0}" != "1" ]] && command -v hyprctl >/dev/null 2
 
   hyprctl reload >/dev/null 2>&1 || true
   sleep 1
+
+  # If the reload wedged the compositor, undo the config so the next login is
+  # clean instead of showing a black screen again.
+  if ! compositor_alive; then
+    log "Hyprland did not respond after the config reload; rolling back"
+    rollback_config
+    notify critical "tilesgrid rolled back" \
+      "Hyprland stopped responding after the config reload. The previous config was restored; restart Hyprland."
+    exit 1
+  fi
+
+  # A config reload does not load the native plugin; it loads at compositor
+  # start. When no plugin is holding the hooks, load it into the running
+  # compositor now so the workspace keys work without waiting for a restart.
+  if (( ! plugin_loaded )) && ! hyprtasking_loaded; then
+    log "loading the plugin into the running compositor"
+    hyprctl plugin load "$INSTALL_DIR/libtilesgrid.so" >/dev/null 2>&1 || true
+    sleep 1
+    if ! compositor_alive; then
+      log "Hyprland did not respond after loading the plugin; rolling back"
+      rollback_config
+      notify critical "tilesgrid rolled back" \
+        "Hyprland stopped responding while loading the plugin. The previous config was restored; restart Hyprland."
+      exit 1
+    fi
+  fi
 
   if ! hyprctl plugin list 2>/dev/null | grep -q 'tilesgrid'; then
     if hyprtasking_loaded; then

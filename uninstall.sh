@@ -34,7 +34,10 @@ fi
 # (older installers could back up a file they had just installed).
 restore_or_remove() {
   local backup="$1" target="$2" package="$3"
-  if [[ -f "$backup" ]] && ! cmp -s "$backup" "$package"; then
+  # Ignore backups that are themselves tilesgrid output (older installers could
+  # capture a previous version of our own file, which must not be restored).
+  if [[ -f "$backup" ]] && ! cmp -s "$backup" "$package" \
+      && ! grep -qi 'tilesgrid' "$backup" 2>/dev/null; then
     cp -a "$backup" "$target"
   else
     rm -f "$target"
@@ -49,16 +52,19 @@ restore_or_remove "$BACKUP_DIR/tilesgrid-rebuild.hook" "$HOOK_FILE" \
   "$PLUGIN_DIR/config/tilesgrid-rebuild.hook"
 
 if [[ -f "$SHELL_JSON" ]]; then
-  python3 - "$SHELL_JSON" "$BACKUP_DIR/shell.json" <<'PY'
-import json, os, shutil, sys, tempfile
+  python3 - "$SHELL_JSON" <<'PY'
+import json, os, sys, tempfile
 
-path, backup = sys.argv[1], sys.argv[2]
-if os.path.exists(backup):
-    shutil.copy2(backup, path)
+# Replace the tilesgrid widget in the live file with the stock one. Do not
+# restore the pre-install backup blindly: older installers could capture a
+# shell.json that already contained tilesgrid, leaving the widget behind.
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        config = json.load(f)
+except Exception:
     raise SystemExit(0)
 
-with open(path) as f:
-    config = json.load(f)
 layout = config.setdefault("bar", {}).setdefault("layout", {})
 placed = False
 for section, items in list(layout.items()):
@@ -87,7 +93,9 @@ PY
 fi
 
 if [[ "${TILESGRID_SKIP_RELOAD:-0}" != "1" ]] && command -v hyprctl >/dev/null 2>&1; then
-  hyprctl plugin unload "$INSTALL_DIR/libtilesgrid.so" 2>/dev/null || true
+  # Do NOT unload the hooking plugin from the live compositor: unloading hooks
+  # at runtime is unsafe. The .so stays mapped until the next Hyprland start;
+  # removing the config and file is enough.
   hyprctl reload >/dev/null 2>&1 || true
 fi
 

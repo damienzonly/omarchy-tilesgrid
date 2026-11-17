@@ -319,8 +319,24 @@ end
 -- hyprctl needs permission to load plugins without an interactive prompt.
 hl.permission("/usr/(bin|local/bin)/hyprctl", "plugin", "allow")
 
+-- Loudly report a failed load instead of silently leaving keys bound to a nil
+-- plugin (the bindings below fall back to stock workspace switching).
+local function warn_missing_plugin()
+  if hl.plugin and hl.plugin.tilesgrid then
+    return
+  end
+  hl.exec_cmd(
+    "command -v omarchy-notification-send >/dev/null 2>&1 && "
+      .. "omarchy-notification-send -u critical -g '󰐃' 'tilesgrid did not load' "
+      .. "'Workspace keys fall back to stock. Check: hyprctl plugin list'"
+  )
+end
+
 if not (hl.plugin and hl.plugin.tilesgrid) then
-  hl.on("hyprland.start", load_native_plugin)
+  hl.on("hyprland.start", function()
+    load_native_plugin()
+    hl.timer(warn_missing_plugin, { timeout = 3000, type = "oneshot" })
+  end)
 end
 
 if hl.plugin.tilesgrid then
@@ -358,6 +374,28 @@ local function tilesgrid()
   return hl.plugin.tilesgrid
 end
 
+-- Keep workspace keys usable when the native plugin is not loaded (ABI
+-- mismatch, hyprtasking still holding the hooks, or an install that happened
+-- after this session started). Falls back to tile 1..9 of page 1 via the map.
+local function fallback_tile(n, move, follow)
+  if _G.monitor_page_workspace == nil then
+    return
+  end
+  local monitor = hl.get_monitor_at_cursor()
+  if monitor == nil or monitor.name == nil then
+    return
+  end
+  local id = _G.monitor_page_workspace(monitor.name, 0, n)
+  if id == nil then
+    return
+  end
+  if move then
+    hl.dispatch(hl.dsp.window.move({ workspace = tostring(id), follow = follow }))
+  else
+    hl.dispatch(hl.dsp.focus({ workspace = tostring(id) }))
+  end
+end
+
 hl.unbind("SUPER + TAB")
 o.bind("SUPER + TAB", "Workspace overview", function()
   local plugin = tilesgrid()
@@ -383,18 +421,24 @@ for n = 1, 9 do
     local plugin = tilesgrid()
     if plugin then
       plugin.focus(n)
+    else
+      fallback_tile(n, false, false)
     end
   end)
   o.bind("SUPER + SHIFT + " .. key, "Move window to tile " .. n .. " and follow", function()
     local plugin = tilesgrid()
     if plugin then
       plugin.move_to_tile(n, true)
+    else
+      fallback_tile(n, true, true)
     end
   end)
   o.bind("SUPER + SHIFT + ALT + " .. key, "Move window silently to tile " .. n, function()
     local plugin = tilesgrid()
     if plugin then
       plugin.move_to_tile(n, false)
+    else
+      fallback_tile(n, true, false)
     end
   end)
 end
