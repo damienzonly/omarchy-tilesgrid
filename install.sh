@@ -42,6 +42,45 @@ fail() {
   exit 1
 }
 
+# hyprpm keeps the enabled/disabled state (and built plugins) in
+# /var/cache/hyprpm/$USER. It must be writable by the user; a root-owned cache
+# (from running hyprpm via sudo once) makes every disable/enable fail with
+# "Failed to write plugin state".
+HYPRPM_STATE_DIR="/var/cache/hyprpm/${USER}"
+[[ -d "$HYPRPM_STATE_DIR" ]] || HYPRPM_STATE_DIR="$HOME/.cache/hyprpm"
+
+hyprtasking_enabled() {
+  command -v hyprpm >/dev/null 2>&1 || return 1
+  hyprpm list 2>/dev/null | awk '
+    /Plugin hyprtasking/ { found = 1; next }
+    found && /enabled:/    { print; exit }
+  ' | grep -qi 'true'
+}
+
+# hyprtasking and tilesgrid hook the same render/input functions. Hyprland
+# refuses to hook a function twice ("function is already hooked"), so it is not
+# enough for hyprpm to *record* hyprtasking as disabled: the running compositor
+# also has to unload it before tilesgrid can initialise.
+hyprtasking_loaded() {
+  command -v hyprctl >/dev/null 2>&1 || return 1
+  hyprctl plugin list 2>/dev/null | grep -qi 'Hyprtasking'
+}
+
+hyprtasking_so() {
+  local candidate
+  for candidate in \
+    "$HYPRPM_STATE_DIR/hyprtasking/hyprtasking.so" \
+    "$HOME/.cache/hyprpm/hyprtasking/hyprtasking.so" \
+    "$HOME/.cache/hyprpm/${USER}/hyprtasking/hyprtasking.so" \
+    "$HOME/.local/share/hyprpm/hyprtasking/hyprtasking.so"; do
+    if [[ -f "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 [[ $EUID -ne 0 ]] || fail "run install.sh as your user, not root"
 
 mkdir -p "$STATE_DIR" "$BACKUP_DIR"
@@ -250,15 +289,20 @@ os.replace(tmp, path)
 PY
 fi
 
-# Upstream hyprtasking hooks the same render/input functions. If it is still
-# enabled, disable it (best effort; hyprpm's cache must be user-writable) so the
-# fixed tilesgrid build wins.
-if command -v hyprpm >/dev/null 2>&1; then
-  if hyprpm list 2>/dev/null | grep -q 'hyprtasking'; then
-    log "disabling upstream hyprtasking"
-    hyprpm disable hyprtasking >/dev/null 2>&1 \
-      || notify critical "hyprtasking is still enabled" \
-        "Run 'hyprpm disable hyprtasking' or remove its config, then restart Hyprland"
+# Upstream hyprtasking hooks the same render/input functions. Disable it while
+# it is actually enabled (hyprpm list still mentions the repository once it is
+# disabled), and report the real error instead of swallowing it.
+if hyprtasking_enabled; then
+  log "disabling upstream hyprtasking"
+  if ! hyprpm_error="$(hyprpm disable hyprtasking 2>&1)"; then
+    log "hyprpm disable failed: ${hyprpm_error:-unknown error}"
+    if [[ -d "$HYPRPM_STATE_DIR" && ! -w "$HYPRPM_STATE_DIR" ]]; then
+      notify critical "hyprtasking is still enabled" \
+        "hyprpm cannot write $HYPRPM_STATE_DIR (owner: $(stat -c '%U' "$HYPRPM_STATE_DIR" 2>/dev/null || echo unknown)). Run: sudo chown -R $USER $HYPRPM_STATE_DIR, then re-run this installer"
+    else
+      notify critical "hyprtasking is still enabled" \
+        "hyprpm disable failed: ${hyprpm_error:-unknown error}. Run 'hyprpm disable hyprtasking' before restarting Hyprland"
+    fi
   fi
 fi
 
@@ -268,12 +312,27 @@ if [[ "${TILESGRID_SKIP_RELOAD:-0}" != "1" ]] && command -v hyprctl >/dev/null 2
     plugin_loaded=1
   fi
 
+  # hyprpm disable only records the state; the running compositor keeps
+  # hyprtasking loaded (and holding the hooks) until Hyprland restarts.
+  # Unloading a hooking plugin at runtime is unsafe and no longer needed: the
+  # toggle loads tilesgrid itself from the hyprland.start event, so a restart
+  # is the safe way to switch.
+  if (( ! plugin_loaded )) && hyprtasking_loaded; then
+    log "hyprtasking is still loaded in this session; restart Hyprland to switch to tilesgrid"
+    notify low "tilesgrid" "Restart Hyprland to switch from hyprtasking to tilesgrid"
+  fi
+
   hyprctl reload >/dev/null 2>&1 || true
   sleep 1
 
   if ! hyprctl plugin list 2>/dev/null | grep -q 'tilesgrid'; then
-    notify critical "tilesgrid did not load" \
-      "Run: hyprctl plugin load $INSTALL_DIR/libtilesgrid.so and check hyprctl configerrors"
+    if hyprtasking_loaded; then
+      notify critical "tilesgrid did not load" \
+        "hyprtasking still holds the render/input hooks. Restart Hyprland to let tilesgrid load"
+    else
+      notify critical "tilesgrid did not load" \
+        "Run: hyprctl plugin load $INSTALL_DIR/libtilesgrid.so and check hyprctl configerrors"
+    fi
   elif (( plugin_loaded )); then
     notify normal "tilesgrid updated" "Restart Hyprland to load the new native build"
   else

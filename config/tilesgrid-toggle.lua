@@ -291,17 +291,36 @@ local function write_map()
   end
 end
 
--- Load the native plugin. Hyprland records config-time loads and reloads the
--- config once the plugin is in, which is the pass that applies
--- plugin:tilesgrid:* options. A config that already loaded it (for example a
--- hand-written hypr/tilesgrid.lua) is left alone.
-if not (hl.plugin and hl.plugin.tilesgrid) then
+-- Load the native plugin only after Hyprland has started. It must NOT be
+-- loaded while the config is being parsed: PLUGIN_INIT registers this plugin's
+-- config values, which schedules a config reload, and Hyprland re-enters
+-- pluginInit from the still-pending plugin-load request
+-- (reload -> loadPlugin -> pluginInit -> registerPluginValue -> reload ...).
+-- The compositor spins in that loop and never modesets, so the session looks
+-- frozen/black. hl.plugin.load() is also config-phase only (it silently does
+-- nothing from an event callback), so load via hyprctl once startup is done.
+local function shell_quote(value)
+  return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
+end
+
+local function load_native_plugin()
+  if hl.plugin and hl.plugin.tilesgrid then
+    return
+  end
   local plugin_path = HOME .. "/.local/lib/hyprland/libtilesgrid.so"
   local plugin_file = io.open(plugin_path, "r")
-  if plugin_file then
-    plugin_file:close()
-    hl.plugin.load(plugin_path)
+  if not plugin_file then
+    return
   end
+  plugin_file:close()
+  hl.exec_cmd("hyprctl plugin load " .. shell_quote(plugin_path))
+end
+
+-- hyprctl needs permission to load plugins without an interactive prompt.
+hl.permission("/usr/(bin|local/bin)/hyprctl", "plugin", "allow")
+
+if not (hl.plugin and hl.plugin.tilesgrid) then
+  hl.on("hyprland.start", load_native_plugin)
 end
 
 if hl.plugin.tilesgrid then
