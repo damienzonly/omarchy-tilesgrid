@@ -7,6 +7,7 @@
 #include <vector>
 
 #include <hyprland/src/helpers/AnimatedVariable.hpp>
+#include <hyprland/src/render/Framebuffer.hpp>
 
 #include "../mapping.hpp"
 #include "../types.hpp"
@@ -29,6 +30,32 @@ class HTLayoutGrid: public HTLayoutBase {
 
     // Tile geometry for the current page, including empty Recovered slots.
     std::array<CBox, TilesGrid::TILES_PER_PAGE> tile_boxes {};
+
+    // Cached, offscreen render of each tile's workspace. Re-rendering all nine
+    // tiles into the main framebuffer every frame is the overview's dominant
+    // GPU cost; these let the overview composite cheap textures and refresh a
+    // few tiles per frame instead.
+    struct CachedTile {
+        SP<Render::IFramebuffer> fb;
+        WORKSPACEID id = WORKSPACE_INVALID;
+        Vector2D size {};
+        int windows = -1;
+        bool dirty = true;
+    };
+    std::array<CachedTile, TilesGrid::TILES_PER_PAGE> cached_tiles;
+    size_t next_refresh = 0;
+    uint64_t refresh_tick = 0;
+    bool cache_warm = false;
+
+    bool render_tile_cache(
+        int index,
+        WORKSPACEID slot_id,
+        PHLMONITOR monitor,
+        PHLWORKSPACE workspace,
+        const CBox& box
+    );
+    void render_cached_previews();
+    void invalidate_cached_tiles();
 
     struct PageTab {
         int page = 0;
@@ -64,6 +91,9 @@ class HTLayoutGrid: public HTLayoutBase {
     virtual void init_position();
     virtual void build_overview_layout(HTViewStage stage);
     virtual void render();
+    virtual void refresh_cached_previews() override;
+
+    bool previews_cached() const;
 
     virtual bool on_mouse_axis(double delta) override;
     virtual std::optional<int> page_strip_at(Vector2D pos) override;

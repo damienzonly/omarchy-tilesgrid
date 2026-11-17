@@ -639,6 +639,15 @@ static bool hook_blur_optimizations(void* thisptr, PHLLS pLayer, PHLWINDOW pWind
 static bool hook_should_render_window(void* thisptr, PHLWINDOW window, PHLMONITOR monitor) {
     bool ori_result =
         ((should_render_window_t)(should_render_window_hook->m_original))(thisptr, window, monitor);
+
+    // Rendering a tile into its offscreen framebuffer: Hyprland's own test uses
+    // the workspace state we prepared, not the on-screen tile layout. Only the
+    // dragged window must stay out of its source tile.
+    if (g_cache_render) {
+        const SP<Layout::ITarget> target = g_layoutManager->dragController()->target();
+        return target == nullptr || target->window() != window ? ori_result : false;
+    }
+
     if (ht_manager == nullptr || !ht_manager->has_active_view())
         return ori_result;
     const PHTVIEW view = ht_manager->get_view_from_monitor(monitor);
@@ -919,6 +928,15 @@ static void init_functions() {
         fail_exit("Failed initializing hooks");
 }
 
+static void on_render_pre(PHLMONITOR monitor) {
+    if (ht_manager == nullptr || monitor == nullptr)
+        return;
+    const PHTVIEW view = ht_manager->get_view_from_monitor(monitor);
+    if (view == nullptr || view->layout == nullptr)
+        return;
+    view->layout->refresh_cached_previews();
+}
+
 static void register_callbacks() {
     g_eventListeners.clear();
 
@@ -945,6 +963,10 @@ static void register_callbacks() {
         Event::bus()->m_events.gesture.swipe.update.listen(on_swipe_update));
     g_eventListeners.push_back(
         Event::bus()->m_events.gesture.swipe.end.listen(on_swipe_end));
+
+    // Runs before the monitor's main render pass, so cached tile previews can
+    // render into their own framebuffers without disturbing the active pass.
+    g_eventListeners.push_back(Event::bus()->m_events.render.pre.listen(on_render_pre));
 
     g_eventListeners.push_back(
         Event::bus()->m_events.config.reloaded.listen(on_config_reloaded));
@@ -1082,6 +1104,11 @@ static void init_config() {
     addConfigValue(CFloatValue, "gestures:open_distance", "open distance", 300.0);
     addConfigValue(CIntValue, "gestures:open_positive", "open positive", 1);
 
+    // overview previews
+    addConfigValue(CStringValue, "preview:mode", "preview mode (cached or live)", "cached");
+    addConfigValue(CIntValue, "preview:refresh_tiles", "tile previews re-rendered per frame", 2);
+    addConfigValue(CFloatValue, "preview:scale", "offscreen preview resolution scale", 0.5f);
+
     // page strip
     addConfigValue(CIntValue, "page_strip:height", "page strip height", 34);
     addConfigValue(CIntValue, "page_strip:bg_color", "page strip background", 0xE6151520);
@@ -1135,6 +1162,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     // Listeners point into this shared object; drop them before teardown so a
     // reload cannot fire a callback into unloaded code.
     g_eventListeners.clear();
+    g_cache_render = false;
 
     if (ht_manager != nullptr) {
         ht_manager->page_strip_pointer_active = false;

@@ -26,6 +26,11 @@ inline CFunctionHook* is_solitary_blocked_hook = nullptr;
 typedef uint32_t (*origIsSolitaryBlocked)(void*, bool);
 inline void* render_window = nullptr;
 
+// True while a tile preview is being rendered into an offscreen framebuffer.
+// shouldRenderWindow must defer to HYPRLAND there: the layout's own visibility
+// test is based on on-screen tile boxes, not the offscreen target.
+inline bool g_cache_render = false;
+
 inline std::unique_ptr<HTManager> ht_manager;
 
 // Event-bus listeners are not removed automatically when the plugin unloads.

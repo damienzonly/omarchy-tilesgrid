@@ -85,6 +85,11 @@ class HTLayoutBase {
     // Render the overview
     virtual void render();
 
+    // Refresh any offscreen tile previews. Called from the render.pre event,
+    // before the monitor's main render pass begins, so it can safely bind a
+    // temporary framebuffer.
+    virtual void refresh_cached_previews();
+
     // Workspaces in the same visual order used by the keyboard jump labels.
     std::vector<WORKSPACEID> jump_targets() const;
     std::optional<WORKSPACEID> jump_target(size_t index) const;

@@ -21,6 +21,7 @@
 #include <hyprland/src/render/OpenGL.hpp>
 #include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/render/pass/BorderPassElement.hpp>
+#include <hyprland/src/render/pass/ClearPassElement.hpp>
 #include <hyprland/src/render/pass/RectPassElement.hpp>
 #include <hyprland/src/render/pass/TexPassElement.hpp>
 #include <hyprland/src/state/WorkspaceState.hpp>
@@ -82,7 +83,10 @@ int HTLayoutGrid::recovered_subpage_index() const {
 }
 
 void HTLayoutGrid::set_monitor_base(int64_t base) {
+    if (map_base == base)
+        return;
     map_base = base;
+    invalidate_cached_tiles();
 }
 
 std::optional<WORKSPACEID> HTLayoutGrid::tile_workspace_at(int viewed_page, int tile) const {
@@ -149,6 +153,7 @@ void HTLayoutGrid::refresh_recovered() {
         return;
 
     recovered_ids = std::move(next);
+    invalidate_cached_tiles();
 
     if (is_recovered_view() && page >= visible_page_count()) {
         page = std::max(0, visible_page_count() - 1);
@@ -168,6 +173,7 @@ void HTLayoutGrid::set_viewed_page(int viewed_page) {
     }
 
     page = std::clamp(viewed_page, 0, total - 1);
+    invalidate_cached_tiles();
 
     if (const PHLMONITOR monitor = get_monitor()) {
         build_overview_layout(HT_VIEW_ANIMATING);
@@ -513,6 +519,9 @@ void HTLayoutGrid::on_show(CallbackFun on_complete) {
     if (monitor == nullptr)
         return;
 
+    // Snapshots from a previous open are stale.
+    invalidate_cached_tiles();
+
     *scale = calculate_ws_box(0, 0, HT_VIEW_OPENED).w / monitor->m_transformedSize.x; // 1 / ROWS
     // Offset for the whole grid of workspaces
     *offset = {0, 0};
@@ -718,6 +727,295 @@ void HTLayoutGrid::build_overview_layout(HTViewStage stage) {
         Desktop::focusState()->rawMonitorFocus(last_monitor);
 }
 
+bool HTLayoutGrid::previews_cached() const {
+    return HTConfig::value<Config::STRING>("preview:mode") != "live";
+}
+
+void HTLayoutGrid::invalidate_cached_tiles() {
+    for (auto& tile : cached_tiles)
+        tile.dirty = true;
+    cache_warm = false;
+}
+
+// Render one workspace into an offscreen tile-sized framebuffer. This runs from
+// render.pre, outside the monitor's main render pass, so it can bind a
+// temporary framebuffer. The workspace is made visible/rendered without
+// changing the monitor's active workspace.
+bool HTLayoutGrid::render_tile_cache(
+    int index,
+    WORKSPACEID slot_id,
+    PHLMONITOR monitor,
+    PHLWORKSPACE workspace,
+    const CBox& box
+) {
+    if (monitor == nullptr || box.empty() || index < 0
+        || index >= static_cast<int>(cached_tiles.size()))
+        return false;
+
+    auto& tile = cached_tiles[index];
+    const float preview_scale = std::clamp(
+        static_cast<float>(HTConfig::value<Config::FLOAT>("preview:scale")),
+        0.25f,
+        1.f
+    );
+    const Vector2D size = (box.size() * monitor->m_scale * preview_scale).round();
+    if (size.x < 1 || size.y < 1)
+        return false;
+
+    if (tile.fb == nullptr)
+        tile.fb = g_pHyprRenderer->createFB("tilesgrid-tile");
+    if (tile.fb == nullptr)
+        return false;
+
+    if (!tile.fb->isAllocated() || tile.fb->m_size != size) {
+        tile.fb->release();
+        if (!tile.fb->alloc(
+                static_cast<int>(size.x),
+                static_cast<int>(size.y),
+                DRM_FORMAT_ABGR8888
+            ))
+            return false;
+        tile.fb->setImageDescription(monitor->workBufferImageDescription());
+    }
+
+    CRegion damage {0, 0, static_cast<int>(size.x), static_cast<int>(size.y)};
+    if (!g_pHyprRenderer->beginFullFakeRender(monitor, damage, tile.fb))
+        return false;
+
+    const bool saved_snapshot = g_pHyprRenderer->m_bRenderingSnapshot;
+    const bool saved_blur_dirty = monitor->m_blurFBDirty;
+    const bool saved_blur_should = monitor->m_blurFBShouldRender;
+    g_pHyprRenderer->m_bRenderingSnapshot = true;
+    monitor->m_blurFBDirty = false;
+    monitor->m_blurFBShouldRender = false;
+
+    g_pHyprRenderer->draw(CClearPassElement::SClearData {CHyprColor {0, 0, 0, 1}});
+    g_pHyprRenderer->startRenderPass();
+
+    // Hyprexpo-style preview state: render the workspace at alpha 1 with no
+    // slide offset, then restore exactly what the desktop was using.
+    const PHLWORKSPACE saved_active = monitor->m_activeWorkspace;
+    const bool saved_active_visible =
+        saved_active != nullptr && saved_active->m_visible;
+    const bool saved_visible = workspace != nullptr && workspace->m_visible;
+    const bool saved_force = workspace != nullptr && workspace->m_forceRendering;
+    const float saved_alpha_value = workspace != nullptr ? workspace->m_alpha->value() : 0.f;
+    const float saved_alpha_goal = workspace != nullptr ? workspace->m_alpha->goal() : 0.f;
+    const Vector2D saved_offset_value =
+        workspace != nullptr ? workspace->m_renderOffset->value() : Vector2D {};
+    const Vector2D saved_offset_goal =
+        workspace != nullptr ? workspace->m_renderOffset->goal() : Vector2D {};
+
+    // Hyprland's shouldRenderWindow() treats a visible workspace's windows as
+    // renderable regardless of which workspace renderWorkspace() was asked
+    // for. Hide the real active workspace while a different tile is rendered,
+    // or its windows would leak into every tile.
+    if (saved_active != nullptr && saved_active != workspace)
+        saved_active->m_visible = false;
+    monitor->m_activeWorkspace = workspace;
+
+    if (workspace != nullptr) {
+        workspace->m_visible = true;
+        workspace->m_forceRendering = true;
+        workspace->m_alpha->setValueAndWarp(1.f);
+        *workspace->m_alpha = 1.f;
+        workspace->m_renderOffset->setValueAndWarp(Vector2D {});
+        *workspace->m_renderOffset = Vector2D {};
+    }
+
+    CBox render_box = {Vector2D {}, box.size()};
+    if (monitor->m_transform % 2 == 1)
+        std::swap(render_box.w, render_box.h);
+
+    g_cache_render = true;
+    ((render_workspace_t)(render_workspace_hook->m_original))(
+        g_pHyprRenderer.get(), monitor, workspace, Time::steadyNow(), render_box
+    );
+    g_cache_render = false;
+
+    if (workspace != nullptr) {
+        workspace->m_visible = saved_visible;
+        workspace->m_forceRendering = saved_force;
+        workspace->m_alpha->setValueAndWarp(saved_alpha_value);
+        *workspace->m_alpha = saved_alpha_goal;
+        workspace->m_renderOffset->setValueAndWarp(saved_offset_value);
+        *workspace->m_renderOffset = saved_offset_goal;
+    }
+
+    if (saved_active != nullptr && saved_active != workspace)
+        saved_active->m_visible = saved_active_visible;
+    monitor->m_activeWorkspace = saved_active;
+
+    g_pHyprRenderer->endRender();
+    g_pHyprRenderer->m_bRenderingSnapshot = saved_snapshot;
+    monitor->m_blurFBDirty = saved_blur_dirty;
+    monitor->m_blurFBShouldRender = saved_blur_should;
+
+    tile.id = slot_id;
+    tile.size = size;
+    tile.windows = workspace != nullptr ? workspace->getWindowCount() : 0;
+    tile.dirty = false;
+    return true;
+}
+
+void HTLayoutGrid::render_cached_previews() {
+    for (int i = 0; i < static_cast<int>(cached_tiles.size()); i++) {
+        auto& tile = cached_tiles[i];
+        if (tile.fb == nullptr || !tile_ids[i].has_value())
+            continue;
+        if (tile.id != *tile_ids[i] || tile_boxes[i].empty())
+            continue;
+
+        const auto texture = tile.fb->getTexture();
+        if (texture == nullptr)
+            continue;
+
+        CTexPassElement::SRenderData data;
+        data.tex = texture;
+        data.box = tile_boxes[i];
+        data.a = 1.f;
+        g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(std::move(data)));
+    }
+}
+
+void HTLayoutGrid::refresh_cached_previews() {
+    if (!previews_cached())
+        return;
+
+    const PHTVIEW view = ht_manager == nullptr ? nullptr : ht_manager->get_view_from_id(view_id);
+    if (view == nullptr || !view->active || view->closing || view->navigating)
+        return;
+
+    const PHLMONITOR monitor = get_monitor();
+    if (monitor == nullptr || monitor->m_transform % 2 == 1)
+        return;
+
+    build_overview_layout(HT_VIEW_ANIMATING);
+
+    WORKSPACEID drag_workspace = WORKSPACE_INVALID;
+    if (const auto target = g_layoutManager->dragController()->target(); target != nullptr) {
+        if (const auto dragged = target->window(); dragged != nullptr && dragged->m_workspace)
+            drag_workspace = dragged->m_workspace->m_id;
+    }
+
+    const float preview_scale = std::clamp(
+        static_cast<float>(HTConfig::value<Config::FLOAT>("preview:scale")),
+        0.25f,
+        1.f
+    );
+
+    std::vector<int> required;
+    std::vector<int> windowed;
+    bool ids_changed = false;
+
+    for (int i = 0; i < static_cast<int>(cached_tiles.size()); i++) {
+        auto& tile = cached_tiles[i];
+        const CBox& box = tile_boxes[i];
+        if (box.empty() || !tile_ids[i].has_value()) {
+            tile.dirty = true;
+            continue;
+        }
+
+        const WORKSPACEID id = *tile_ids[i];
+        PHLWORKSPACE workspace = State::workspaceState()->query().id(id).run();
+        // A fixed workspace that moved to another monitor is not this tile's
+        // content; render the empty background for it, as the live path does.
+        if (workspace != nullptr && workspace->monitorID() != view_id)
+            workspace = nullptr;
+        const int windows = workspace != nullptr ? workspace->getWindowCount() : 0;
+        const Vector2D size =
+            (box.size() * monitor->m_scale * preview_scale).round();
+        const bool size_changed =
+            tile.fb == nullptr || !tile.fb->isAllocated() || tile.size != size;
+
+        if (tile.dirty || tile.id != id || tile.windows != windows || size_changed
+            || (drag_workspace != WORKSPACE_INVALID && id == drag_workspace)) {
+            if (tile.id != id || size_changed)
+                ids_changed = true;
+            required.push_back(i);
+        } else if (windows > 0) {
+            windowed.push_back(i);
+        }
+    }
+
+    const auto render_index = [&](int index) {
+        const WORKSPACEID id = *tile_ids[index];
+        PHLWORKSPACE workspace = State::workspaceState()->query().id(id).run();
+        if (workspace != nullptr && workspace->monitorID() != view_id)
+            workspace = nullptr;
+        return render_tile_cache(index, id, monitor, workspace, tile_boxes[index]);
+    };
+
+    // First frame after opening or changing pages: warm all tiles at once so
+    // the overview never shows blank or stale tiles.
+    if (!cache_warm) {
+        for (int i = 0; i < static_cast<int>(cached_tiles.size()); i++) {
+            if (tile_boxes[i].empty() || !tile_ids[i].has_value())
+                continue;
+            render_index(i);
+        }
+        cache_warm = true;
+        next_refresh = 0;
+        return;
+    }
+
+    if (ids_changed) {
+        for (const int index : required)
+            render_index(index);
+        return;
+    }
+
+    const int configured = static_cast<int>(
+        HTConfig::value<Config::INTEGER>("preview:refresh_tiles")
+    );
+    int budget = std::clamp(configured, 0, TilesGrid::TILES_PER_PAGE);
+    if (budget <= 0) {
+        for (const int index : required)
+            render_index(index);
+        return;
+    }
+
+    std::array<bool, TilesGrid::TILES_PER_PAGE> rendered {};
+    for (const int index : required) {
+        if (budget <= 0)
+            break;
+        if (render_index(index))
+            rendered[index] = true;
+        budget--;
+    }
+
+    // Keep the active tile the most current, but never starve the rotating
+    // previews when the budget is a single tile.
+    const bool allow_active =
+        budget >= 2 || windowed.empty() || refresh_tick % 2 == 0;
+    if (allow_active && budget > 0 && monitor->m_activeWorkspace != nullptr) {
+        for (int i = 0; i < static_cast<int>(cached_tiles.size()) && budget > 0; i++) {
+            if (rendered[i] || !tile_ids[i].has_value() || cached_tiles[i].windows <= 0
+                || *tile_ids[i] != monitor->m_activeWorkspace->m_id)
+                continue;
+            if (render_index(i))
+                rendered[i] = true;
+            budget--;
+            break;
+        }
+    }
+
+    if (budget > 0 && !windowed.empty()) {
+        const size_t start = next_refresh % windowed.size();
+        for (size_t n = 0; n < windowed.size() && budget > 0; n++) {
+            const int index = windowed[(start + n) % windowed.size()];
+            if (rendered[index])
+                continue;
+            if (render_index(index))
+                rendered[index] = true;
+            budget--;
+        }
+        next_refresh = (next_refresh + 1) % windowed.size();
+    }
+
+    refresh_tick++;
+}
+
 // Render each visible workspace directly into its grid tile via a scaled
 // renderWorkspace (renderModif). The renderTexture hook keeps the per-surface
 // scissor in sync with that renderModif, so window contents aren't culled near
@@ -751,16 +1049,27 @@ void HTLayoutGrid::render() {
 
     build_overview_layout(HT_VIEW_ANIMATING);
 
+    // In cached mode the overview is a composite of tile-sized textures, so
+    // only a couple of workspaces are rendered to offscreen buffers per frame
+    // (see refresh_cached_previews). Fall back to direct rendering while the
+    // open/close animation is running.
+    // Rotated outputs keep the live path: offscreen tiles would need the
+    // monitor transform baked into each texture.
+    const bool use_cache = previews_cached() && monitor->m_transform % 2 == 0
+        && par_view->active && !par_view->closing && !par_view->navigating;
+
     // Hyprland only fully renders the active workspace, so render_workspace_at_box
     // swaps each tile's workspace in as it renders; capture the real active one to
     // restore at the end and to pick out the active-border color.
     const PHLWORKSPACE start_workspace = monitor->m_activeWorkspace;
     if (start_workspace == nullptr)
         return;
-    Animation::Workspace::startAnimation(
-        start_workspace, Animation::Workspace::ANIMATION_TYPE_OUT, false, true
-    );
-    start_workspace->m_visible = false;
+    if (!use_cache) {
+        Animation::Workspace::startAnimation(
+            start_workspace, Animation::Workspace::ANIMATION_TYPE_OUT, false, true
+        );
+        start_workspace->m_visible = false;
+    }
 
     CBox global_mon_box = {monitor->m_position, monitor->m_transformedSize};
     const auto tile_visible = [&](const CBox& box) {
@@ -770,42 +1079,53 @@ void HTLayoutGrid::render() {
         return !global_box.expand(BORDERSIZE).intersection(global_mon_box).empty();
     };
 
-    // Borders first, so window contents render on top of them. Workspace contents now
-    // render unclipped (a window moving to a new workspace on release can extend past
-    // its tile), and should not be covered by the tile borders.
-    for (size_t i = 0; i < tile_boxes.size(); i++) {
-        const CBox& box = tile_boxes[i];
-        if (!tile_visible(box))
-            continue;
-        const bool active = tile_ids[i].has_value() && *tile_ids[i] == start_workspace->m_id;
-        CBorderPassElement::SBorderData bdata;
-        bdata.box = box;
-        bdata.grad1 = active ? *ACTIVECOL : *INACTIVECOL;
-        bdata.borderSize = BORDERSIZE;
-        g_pHyprRenderer->m_renderPass.add(makeUnique<CBorderPassElement>(bdata));
-    }
+    const auto draw_borders = [&] {
+        for (size_t i = 0; i < tile_boxes.size(); i++) {
+            const CBox& box = tile_boxes[i];
+            if (!tile_visible(box))
+                continue;
+            const bool active =
+                tile_ids[i].has_value() && *tile_ids[i] == start_workspace->m_id;
+            CBorderPassElement::SBorderData bdata;
+            bdata.box = box;
+            bdata.grad1 = active ? *ACTIVECOL : *INACTIVECOL;
+            bdata.borderSize = BORDERSIZE;
+            g_pHyprRenderer->m_renderPass.add(makeUnique<CBorderPassElement>(bdata));
+        }
+    };
 
-    // workspace may be nullptr for empty/never-visited slots: render_workspace_at_box
-    // still draws their background + wallpaper layers so the tile isn't blank. Render
-    // the active workspace last so its windows (e.g. one just dropped) stay on top of
-    // the neighbouring tiles.
-    for (const auto& [ws_id, ws_layout] : overview_layout) {
-        if (!tile_visible(ws_layout.box) || ws_id == start_workspace->m_id)
-            continue;
-        PHLWORKSPACE workspace = State::workspaceState()->query().id(ws_id).run();
-        if (workspace != nullptr && workspace->monitorID() != view_id)
-            continue;
-        render_workspace_at_box(monitor, workspace, time, ws_layout.box);
-    }
-    if (const auto it = overview_layout.find(start_workspace->m_id);
-        it != overview_layout.end() && tile_visible(it->second.box))
-        render_workspace_at_box(monitor, start_workspace, time, it->second.box);
+    if (use_cache) {
+        render_cached_previews();
+        // Borders on top, since the cached textures are clipped to their tiles.
+        draw_borders();
+    } else {
+        // Borders first, so window contents render on top of them. Workspace contents
+        // now render unclipped (a window moving to a new workspace on release can
+        // extend past its tile), and should not be covered by the tile borders.
+        draw_borders();
 
-    monitor->m_activeWorkspace = start_workspace;
-    Animation::Workspace::startAnimation(
-        start_workspace, Animation::Workspace::ANIMATION_TYPE_IN, false, true
-    );
-    start_workspace->m_visible = true;
+        // workspace may be nullptr for empty/never-visited slots: render_workspace_at_box
+        // still draws their background + wallpaper layers so the tile isn't blank. Render
+        // the active workspace last so its windows (e.g. one just dropped) stay on top of
+        // the neighbouring tiles.
+        for (const auto& [ws_id, ws_layout] : overview_layout) {
+            if (!tile_visible(ws_layout.box) || ws_id == start_workspace->m_id)
+                continue;
+            PHLWORKSPACE workspace = State::workspaceState()->query().id(ws_id).run();
+            if (workspace != nullptr && workspace->monitorID() != view_id)
+                continue;
+            render_workspace_at_box(monitor, workspace, time, ws_layout.box);
+        }
+        if (const auto it = overview_layout.find(start_workspace->m_id);
+            it != overview_layout.end() && tile_visible(it->second.box))
+            render_workspace_at_box(monitor, start_workspace, time, it->second.box);
+
+        monitor->m_activeWorkspace = start_workspace;
+        Animation::Workspace::startAnimation(
+            start_workspace, Animation::Workspace::ANIMATION_TYPE_IN, false, true
+        );
+        start_workspace->m_visible = true;
+    }
 
     g_pHyprRenderer->damageMonitor(monitor);
 
