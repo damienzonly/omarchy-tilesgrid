@@ -10,6 +10,7 @@
 #include <hyprland/src/render/OpenGL.hpp>
 #include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/render/pass/RendererHintsPassElement.hpp>
+#include <hyprland/src/state/WorkspaceState.hpp>
 #include <hyprutils/math/Vector2D.hpp>
 
 #include "globals.hpp"
@@ -71,14 +72,37 @@ void render_workspace_at_box(
     if (monitor->m_transform % 2 == 1)
         std::swap(render_box.w, render_box.h);
 
-    // Hyprland only fully renders the monitor's active workspace, so make this one
-    // active+visible while we render it. The caller restores the original active ws.
+    // Do not swap the monitor's active workspace here. Focus dispatchers and
+    // click-to-focus read m_activeWorkspace, and a transient swap can make
+    // SUPER+N resolve the wrong page. Instead hide every other visible
+    // workspace for the duration of this render: Hyprland's shouldRenderWindow()
+    // treats any visible workspace's windows as renderable regardless of the
+    // workspace passed to renderWorkspace().
+    std::vector<std::pair<PHLWORKSPACE, bool>> hidden_workspaces;
+    for (const auto& other : State::workspaceState()->workspacesCopy()) {
+        if (other == nullptr || other == workspace || other->m_isSpecialWorkspace
+            || other->monitorID() != monitor->m_id || !other->m_visible)
+            continue;
+        hidden_workspaces.emplace_back(other, true);
+        other->m_visible = false;
+    }
+
+    const bool saved_visible = workspace != nullptr && workspace->m_visible;
+    const bool saved_force = workspace != nullptr && workspace->m_forceRendering;
+    const float saved_alpha_value = workspace != nullptr ? workspace->m_alpha->value() : 0.f;
+    const float saved_alpha_goal = workspace != nullptr ? workspace->m_alpha->goal() : 0.f;
+    const Vector2D saved_offset_value =
+        workspace != nullptr ? workspace->m_renderOffset->value() : Vector2D {};
+    const Vector2D saved_offset_goal =
+        workspace != nullptr ? workspace->m_renderOffset->goal() : Vector2D {};
+
     if (workspace != nullptr) {
-        monitor->m_activeWorkspace = workspace;
-        Animation::Workspace::startAnimation(
-            workspace, Animation::Workspace::ANIMATION_TYPE_IN, false, true
-        );
         workspace->m_visible = true;
+        workspace->m_forceRendering = true;
+        workspace->m_alpha->setValueAndWarp(1.f);
+        *workspace->m_alpha = 1.f;
+        workspace->m_renderOffset->setValueAndWarp(Vector2D {});
+        *workspace->m_renderOffset = Vector2D {};
     }
 
     ((render_workspace_t)(render_workspace_hook->m_original))(
@@ -86,9 +110,16 @@ void render_workspace_at_box(
     );
 
     if (workspace != nullptr) {
-        Animation::Workspace::startAnimation(
-            workspace, Animation::Workspace::ANIMATION_TYPE_OUT, false, true
-        );
-        workspace->m_visible = false;
+        workspace->m_visible = saved_visible;
+        workspace->m_forceRendering = saved_force;
+        workspace->m_alpha->setValueAndWarp(saved_alpha_value);
+        *workspace->m_alpha = saved_alpha_goal;
+        workspace->m_renderOffset->setValueAndWarp(saved_offset_value);
+        *workspace->m_renderOffset = saved_offset_goal;
+    }
+
+    for (auto& [other, was_visible] : hidden_workspaces) {
+        if (other != nullptr)
+            other->m_visible = was_visible;
     }
 }

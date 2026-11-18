@@ -1105,7 +1105,7 @@ static void init_config() {
     addConfigValue(CIntValue, "gestures:open_positive", "open positive", 1);
 
     // overview previews
-    addConfigValue(CStringValue, "preview:mode", "preview mode (live or cached)", "live");
+    addConfigValue(CStringValue, "preview:mode", "preview mode (cached or live)", "cached");
     addConfigValue(CIntValue, "preview:refresh_tiles", "tile previews re-rendered per frame", 2);
     addConfigValue(CFloatValue, "preview:scale", "offscreen preview resolution scale", 0.5f);
 
