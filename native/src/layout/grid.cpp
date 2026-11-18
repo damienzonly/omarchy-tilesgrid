@@ -794,9 +794,22 @@ bool HTLayoutGrid::render_tile_cache(
 
     // Hyprexpo-style preview state: render the workspace at alpha 1 with no
     // slide offset, then restore exactly what the desktop was using.
-    const PHLWORKSPACE saved_active = monitor->m_activeWorkspace;
-    const bool saved_active_visible =
-        saved_active != nullptr && saved_active->m_visible;
+    //
+    // Do NOT swap the monitor's active workspace here. Input handlers, focus
+    // dispatchers and the click-to-focus path all read m_activeWorkspace, and
+    // a transient swap makes SUPER+N resolve the wrong page. Hide every other
+    // workspace on this monitor instead: Hyprland's shouldRenderWindow() treats
+    // any visible workspace's windows as renderable regardless of the
+    // workspace passed to renderWorkspace().
+    std::vector<std::pair<PHLWORKSPACE, bool>> hidden_workspaces;
+    for (const auto& other : State::workspaceState()->workspacesCopy()) {
+        if (other == nullptr || other == workspace || other->m_isSpecialWorkspace
+            || other->monitorID() != monitor->m_id || !other->m_visible)
+            continue;
+        hidden_workspaces.emplace_back(other, true);
+        other->m_visible = false;
+    }
+
     const bool saved_visible = workspace != nullptr && workspace->m_visible;
     const bool saved_force = workspace != nullptr && workspace->m_forceRendering;
     const float saved_alpha_value = workspace != nullptr ? workspace->m_alpha->value() : 0.f;
@@ -805,14 +818,6 @@ bool HTLayoutGrid::render_tile_cache(
         workspace != nullptr ? workspace->m_renderOffset->value() : Vector2D {};
     const Vector2D saved_offset_goal =
         workspace != nullptr ? workspace->m_renderOffset->goal() : Vector2D {};
-
-    // Hyprland's shouldRenderWindow() treats a visible workspace's windows as
-    // renderable regardless of which workspace renderWorkspace() was asked
-    // for. Hide the real active workspace while a different tile is rendered,
-    // or its windows would leak into every tile.
-    if (saved_active != nullptr && saved_active != workspace)
-        saved_active->m_visible = false;
-    monitor->m_activeWorkspace = workspace;
 
     if (workspace != nullptr) {
         workspace->m_visible = true;
@@ -845,9 +850,10 @@ bool HTLayoutGrid::render_tile_cache(
         *workspace->m_renderOffset = saved_offset_goal;
     }
 
-    if (saved_active != nullptr && saved_active != workspace)
-        saved_active->m_visible = saved_active_visible;
-    monitor->m_activeWorkspace = saved_active;
+    for (auto& [other, was_visible] : hidden_workspaces) {
+        if (other != nullptr)
+            other->m_visible = was_visible;
+    }
 
     g_pHyprRenderer->endRender();
     g_pHyprRenderer->m_bRenderingSnapshot = saved_snapshot;
